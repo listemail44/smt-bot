@@ -1,0 +1,6 @@
+python-telegram-bot==22.8
+websocket-client==0.56
+requests
+pandas
+numpy
+git+https://github.com/iqoptionapi/iqoptionapi.git
