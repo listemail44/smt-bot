@@ -412,8 +412,37 @@ class IQOptionAdapter:
         except Exception:
             pass
 
+    def switch_account(self, practice: bool) -> bool:
+        """Switch the already-authenticated IQ Option session between Demo and Real."""
+        mode = "PRACTICE" if practice else "REAL"
+        ok = self.api.change_balance(mode)
+        self.practice = practice
+        return True if ok is None else bool(ok)
+
     def balance(self) -> float:
         return float(self.api.get_balance())
+
+    def currency(self) -> str:
+        """Return the currency code for the currently selected IQ Option account."""
+        try:
+            value = self.api.get_currency()
+            if value:
+                return str(value).upper()
+        except Exception:
+            pass
+        # Fallback: inspect the balances returned by the API.
+        try:
+            balances = self.api.get_balances()
+            if isinstance(balances, dict):
+                rows = balances.get("msg", [])
+            else:
+                rows = balances or []
+            for row in rows:
+                if isinstance(row, dict) and row.get("currency"):
+                    return str(row["currency"]).upper()
+        except Exception:
+            pass
+        return "UNKNOWN"
 
     def open_assets(self) -> List[str]:
         data = self.api.get_all_open_time()

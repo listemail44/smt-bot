@@ -1,7 +1,7 @@
 """
 smt-bot — Telegram IQ Option Confidence Bot
 
-Practice-first Telegram interface for the user's locked trading rules.
+Demo-first Telegram interface for the user's locked trading rules.
 
 IMPORTANT:
 - Uses the community-maintained iqoptionapi package. Its repository warns it is
@@ -9,7 +9,7 @@ IMPORTANT:
 - The displayed confidence is a strategy score, NOT a calibrated probability.
 - Passwords are kept only in memory for the current bot process and the bot
   attempts to delete the Telegram password message immediately after receipt.
-- This first Telegram build is intended for PRACTICE/DEMO testing.
+- Demo is the default account. Real-account switching is available from Settings.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ class UserState:
     chat_id: int
     email: Optional[str] = None
     adapter: Optional[IQOptionAdapter] = None
-    practice: bool = True
+    practice: bool = True  # Demo by default; IQ Option API label is PRACTICE
     stake: float = DEFAULT_STAKE
     expiry: int = DEFAULT_EXPIRY
     min_confidence: float = MIN_CONFIDENCE
@@ -61,6 +61,7 @@ class UserState:
     cycle_trades: List[dict] = field(default_factory=list)
     all_results: List[dict] = field(default_factory=list)
     active_tasks: set = field(default_factory=set)
+    scan_tasks: set = field(default_factory=set)
 
 STATES: Dict[int, UserState] = {}
 
@@ -89,7 +90,7 @@ def settings_menu():
          InlineKeyboardButton("⏱ Expiry", callback_data="set_expiry")],
         [InlineKeyboardButton("🛡 Daily Loss Limit", callback_data="set_loss"),
          InlineKeyboardButton("💵 Min Payout", callback_data="set_payout")],
-        [InlineKeyboardButton("🏦 Practice / Real", callback_data="set_account")],
+        [InlineKeyboardButton("🏦 ACCOUNT: DEMO", callback_data="set_account")],
         [InlineKeyboardButton("⬅️ Main Menu", callback_data="main")],
     ])
 
@@ -106,7 +107,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Minimum confidence: *80%*\n"
             "Auto-Run: *1 hour*\n"
             "Maximum trades/cycle: *20*\n\n"
-            "Practice/Demo is the default.\n\n"
+            "Account: *DEMO (default)*\n\n"
             "Press CONNECT to begin.",
             parse_mode="Markdown", reply_markup=kb)
     else:
@@ -148,7 +149,7 @@ async def got_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    await context.bot.send_message(chat_id, "🔄 Connecting to IQ Option Practice account...")
+    await context.bot.send_message(chat_id, "🔄 Connecting to IQ Option Demo account...")
 
     def do_connect():
         adapter = IQOptionAdapter(email, password, practice=True)
@@ -173,13 +174,16 @@ async def got_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s.email = email
     s.adapter = adapter
     s.practice = True
+    account_currency = await asyncio.to_thread(adapter.currency)
+    s.currency = account_currency
     context.user_data.pop("pending_email", None)
 
     await context.bot.send_message(
         chat_id,
         f"✅ *IQ OPTION CONNECTED*\n\n"
-        f"Account: PRACTICE\n"
-        f"Balance: `{balance:,.2f}`\n\n"
+        f"Account: DEMO\n"
+        f"Currency: *{account_currency}*\n"
+        f"Balance: `{account_currency} {balance:,.2f}`\n\n"
         f"Minimum confidence: *{s.min_confidence:.0f}%*\n"
         f"Auto-Run cycle: *{s.cycle_minutes} minutes*\n"
         f"Maximum trades: *{s.max_trades}*\n\n"
@@ -196,13 +200,20 @@ def candle_seconds(expiry: int) -> int:
     return max(60, expiry * 60)
 
 async def scan_signals(s: UserState, limit: int = 6):
+    """Scan qualifying pairs without blocking Telegram's event loop.
+
+    Each slow IQ Option API call is moved to a worker thread. The caller can
+    cancel the scan task at any time; the Telegram bot remains responsive.
+    """
     if not s.adapter:
         raise RuntimeError("Not connected.")
     assets = await asyncio.to_thread(s.adapter.open_assets)
     signals = []
 
-    # Scan a bounded set to keep Telegram responsive.
+    # Keep the scan bounded. More importantly, yield back to Telegram between
+    # every pair so STOP and other buttons can be handled immediately.
     for asset in assets[:80]:
+        await asyncio.sleep(0)
         try:
             candles = await asyncio.to_thread(
                 s.adapter.candles, asset, candle_seconds(s.expiry), DEFAULT_LOOKBACK
@@ -223,7 +234,6 @@ async def scan_signals(s: UserState, limit: int = 6):
             if sig.confidence < s.min_confidence:
                 continue
 
-            # Optional user-set payout filter. Zero means disabled.
             if s.min_payout > 0:
                 payout = await asyncio.to_thread(s.adapter.payout, asset)
                 sig.payout = payout
@@ -231,11 +241,59 @@ async def scan_signals(s: UserState, limit: int = 6):
                     continue
 
             signals.append(sig)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             continue
 
     signals.sort(key=lambda x: x.confidence, reverse=True)
     return signals[:limit]
+
+
+def start_background_scan(s: UserState, chat_id: int, context: ContextTypes.DEFAULT_TYPE,
+                          mode: str = "scan"):
+    """Start a scan as a background task so Telegram buttons remain responsive."""
+    task = asyncio.create_task(run_scan_job(s, chat_id, context, mode))
+    s.scan_tasks.add(task)
+    task.add_done_callback(lambda t: s.scan_tasks.discard(t))
+    return task
+
+
+async def run_scan_job(s: UserState, chat_id: int, context: ContextTypes.DEFAULT_TYPE,
+                       mode: str = "scan"):
+    try:
+        signals = await scan_signals(s, limit=6)
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"❌ Scan failed: {str(e)[:250]}")
+        return
+
+    if mode == "manual":
+        if not signals:
+            await context.bot.send_message(
+                chat_id, "No manual opportunity currently meets the 80% minimum.")
+            return
+        buttons = []
+        for i, sig in enumerate(signals):
+            context.user_data[f"manual_{i}"] = sig
+            buttons.append([InlineKeyboardButton(
+                f"{sig.asset} {sig.direction} {sig.confidence:.0f}%",
+                callback_data=f"manual_trade_{i}")])
+        await context.bot.send_message(
+            chat_id,
+            "🎯 *MANUAL MODE*\n\nSelect a qualifying opportunity:",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if not signals:
+        await context.bot.send_message(
+            chat_id,
+            f"🔎 No qualifying setup found at or above {s.min_confidence:.0f}%.\n"
+            "No trade will be suggested.")
+        return
+    text = "📊 *QUALIFYING OPPORTUNITIES*\n\n" + "\n\n".join(signal_text(x) for x in signals)
+    await context.bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=main_menu())
 
 def signal_text(sig: Signal) -> str:
     reasons = "; ".join(sig.reasons[:4])
@@ -251,19 +309,12 @@ async def scan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not s.adapter:
         await q.message.reply_text("Please connect IQ Option first.")
         return
-    await q.message.reply_text("📊 Scanning available pairs...")
-    try:
-        signals = await scan_signals(s)
-    except Exception as e:
-        await q.message.reply_text(f"❌ Scan failed: {str(e)[:250]}")
+    if s.scan_tasks:
+        await q.message.reply_text("📊 A market scan is already running. You can press 🛑 STOP at any time.")
         return
-    if not signals:
-        await q.message.reply_text(
-            f"🔎 No qualifying setup found at or above {s.min_confidence:.0f}%.\n"
-            "No trade will be suggested.")
-        return
-    text = "📊 *QUALIFYING OPPORTUNITIES*\n\n" + "\n\n".join(signal_text(x) for x in signals)
-    await q.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu())
+    await q.message.reply_text("📊 Scanning available pairs in the background...\n🛑 STOP remains responsive.")
+    start_background_scan(s, q.message.chat_id, context, "scan")
+
 
 async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -272,25 +323,11 @@ async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not s.adapter:
         await q.message.reply_text("Please connect IQ Option first.")
         return
-    await q.message.reply_text("🎯 Scanning for manual opportunities...")
-    try:
-        signals = await scan_signals(s)
-    except Exception as e:
-        await q.message.reply_text(f"❌ Scan failed: {str(e)[:250]}")
+    if s.scan_tasks:
+        await q.message.reply_text("🎯 A scan is already running. Press 🛑 STOP if you want to cancel it.")
         return
-    if not signals:
-        await q.message.reply_text("No manual opportunity currently meets the 80% minimum.")
-        return
-
-    buttons = []
-    for i, sig in enumerate(signals):
-        context.user_data[f"manual_{i}"] = sig
-        buttons.append([InlineKeyboardButton(
-            f"{sig.asset} {sig.direction} {sig.confidence:.0f}%",
-            callback_data=f"manual_trade_{i}")])
-    await q.message.reply_text(
-        "🎯 *MANUAL MODE*\n\nSelect a qualifying opportunity:",
-        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    await q.message.reply_text("🎯 Scanning for manual opportunities in the background...\n🛑 STOP remains responsive.")
+    start_background_scan(s, q.message.chat_id, context, "manual")
 
 async def manual_trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -512,10 +549,28 @@ async def settle_auto_trade(chat_id: int, record: dict):
 
 async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await q.answer("STOP received")
     s = state_for(q.message.chat_id)
     s.auto_running = False
-    await q.message.reply_text("🛑 New trade entries have been stopped. Existing trades are not falsely marked as cancelled.")
+
+    cancelled_scans = len(s.scan_tasks)
+    for task in list(s.scan_tasks):
+        if not task.done():
+            task.cancel()
+    s.scan_tasks.clear()
+
+    if cancelled_scans:
+        message = (
+            "🛑 *STOP ACTIVATED*\n\n"
+            f"Cancelled {cancelled_scans} running market scan(s).\n"
+            "No new trade entries will be opened.\n"
+            "Existing trades, if any, are not falsely marked as cancelled.")
+    else:
+        message = (
+            "🛑 *STOP ACTIVATED*\n\n"
+            "No new trade entries will be opened.\n"
+            "Existing trades, if any, are not falsely marked as cancelled.")
+    await q.message.reply_text(message, parse_mode="Markdown", reply_markup=main_menu())
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -526,7 +581,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Minimum confidence: {s.min_confidence:.0f}%\nAuto-Run: {s.cycle_minutes} min\n"
         f"Max trades: {s.max_trades}\nDaily loss limit: {fmt_money(s.daily_loss_limit)}\n"
         f"Minimum payout filter: {s.min_payout:.1f}% (0 = off)\n"
-        f"Account: {'PRACTICE' if s.practice else 'REAL'}",
+        f"Account: {'DEMO' if s.practice else 'REAL'}\n"
+        f"Currency: {getattr(s, 'currency', 'UNKNOWN')}",
         parse_mode="Markdown", reply_markup=settings_menu())
 
 async def setting_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
@@ -569,9 +625,46 @@ async def setting_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    s = state_for(q.message.chat_id)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 DEMO ACCOUNT (DEFAULT)", callback_data="account_demo")],
+        [InlineKeyboardButton("🔴 REAL ACCOUNT", callback_data="account_real")],
+        [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings")],
+    ])
+    current = "DEMO" if s.practice else "REAL"
     await q.message.reply_text(
-        "⚠️ This build is Practice-first. Real-account switching is intentionally disabled "
-        "until the demo workflow is fully tested.")
+        f"🏦 *ACCOUNT MODE*\n\nCurrent account: *{current}*\n\n"
+        "Choose the account you want smt-bot to use.\n\n"
+        "DEMO is the default and is recommended for testing.\n"
+        "Switching accounts changes the IQ Option balance used by the bot; it does not place a trade.",
+        parse_mode="Markdown", reply_markup=kb)
+
+async def switch_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, practice: bool):
+    q = update.callback_query
+    await q.answer()
+    s = state_for(q.message.chat_id)
+    if not s.adapter:
+        await q.message.reply_text("Please connect IQ Option first.")
+        return
+    if s.auto_running or s.scan_tasks:
+        await q.message.reply_text("🛑 Stop Auto-Run or the current market scan before switching accounts.")
+        return
+    try:
+        await asyncio.to_thread(s.adapter.switch_account, practice)
+        s.practice = practice
+        balance = await asyncio.to_thread(s.adapter.balance)
+        label = "DEMO" if practice else "REAL"
+        account_currency = await asyncio.to_thread(s.adapter.currency)
+        s.currency = account_currency
+        await q.message.reply_text(
+            f"✅ *ACCOUNT SWITCHED*\n\nAccount: *{label}*\n"
+            f"Currency: *{account_currency}*\n"
+            f"Balance: `{account_currency} {balance:,.2f}`",
+            parse_mode="Markdown", reply_markup=main_menu())
+    except Exception as e:
+        await q.message.reply_text(
+            f"❌ Could not switch account.\n\n`{str(e)[:250]}`",
+            parse_mode="Markdown")
 
 async def results_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -637,6 +730,10 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await setting_prompt(update, context, "payout")
     if data == "set_account":
         return await account_callback(update, context)
+    if data == "account_demo":
+        return await switch_account_callback(update, context, True)
+    if data == "account_real":
+        return await switch_account_callback(update, context, False)
 
 async def post_init(app: Application):
     global app_instance
@@ -651,6 +748,7 @@ def build_app():
         ApplicationBuilder()
         .token(token)
         .post_init(post_init)
+        .concurrent_updates(True)
         .build()
     )
 
